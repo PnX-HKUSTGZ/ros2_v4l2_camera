@@ -16,6 +16,7 @@
 #include "v4l2_camera/rate_bound_status.hpp"
 
 #include <diagnostic_updater/update_functions.hpp>
+#include <ratio>
 #include <rclcpp/parameter_value.hpp>
 #include <rclcpp/qos.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -183,6 +184,10 @@ V4L2Camera::V4L2Camera(rclcpp::NodeOptions const & options)
   auto timestamp_offset = declare_parameter<int64_t>("timestamp_offset", 0, timestamp_offset_descriptor);
   rclcpp::Duration timestamp_offset_duration = rclcpp::Duration::from_nanoseconds(timestamp_offset);
 
+  auto drop_old_frames_descriptor = rcl_interfaces::msg::ParameterDescriptor{};
+  drop_old_frames_descriptor.description = "Drop older frames and keep only the most recent frame available";
+  drop_old_frames_ = declare_parameter<bool>("drop_old_frames", false, drop_old_frames_descriptor);
+
   // Prepare diagnostics
   auto hardware_id = declare_parameter<std::string>("hardware_id", "");
   min_ok_rate_ = declare_parameter<double>("min_ok_rate", 9.0);
@@ -210,7 +215,8 @@ V4L2Camera::V4L2Camera(rclcpp::NodeOptions const & options)
   diag_composer_ = std::make_shared<diagnostic_updater::CompositeDiagnosticTask>(
       hardware_id.empty() ? "_diagnostics" : hardware_id + "_diagnostics");
 
-  camera_ = std::make_shared<V4l2CameraDevice>(device, use_v4l2_buffer_timestamps, timestamp_offset_duration);
+  camera_ = std::make_shared<V4l2CameraDevice>(
+    device, use_v4l2_buffer_timestamps, timestamp_offset_duration, drop_old_frames_);
 
   if (!camera_->open()) {
     device_node_existence_diag_ = std::make_shared<diagnostic_updater::FunctionDiagnosticTask>(
@@ -360,6 +366,12 @@ V4L2Camera::~V4L2Camera()
   canceled_.store(true);
   if (capture_thread_.joinable()) {
     capture_thread_.join();
+  }
+
+  // Ensure the driver is stopped and released before node teardown
+  if (camera_) {
+    camera_->stop();
+    camera_.reset();
   }
 }
 
@@ -585,6 +597,11 @@ bool V4L2Camera::handleParameter(rclcpp::Parameter const & param)
       RCLCPP_WARN(get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
       return false;
     }
+  } else if (param.get_name() == "drop_old_frames") {
+    RCLCPP_WARN(
+      get_logger(),
+      "Changing drop_old_frames at runtime is not supported; restart the node to apply.");
+    return false;
   }
 
   return false;

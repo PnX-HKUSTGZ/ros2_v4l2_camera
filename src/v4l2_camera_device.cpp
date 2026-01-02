@@ -20,6 +20,8 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include <vector>
 #include <map>
@@ -35,9 +37,23 @@
 using v4l2_camera::V4l2CameraDevice;
 using sensor_msgs::msg::Image;
 
-V4l2CameraDevice::V4l2CameraDevice(std::string device, bool use_v4l2_buffer_timestamps, rclcpp::Duration timestamp_offset_duration)
-: device_{std::move(device)}, use_v4l2_buffer_timestamps_{use_v4l2_buffer_timestamps}, timestamp_offset_{timestamp_offset_duration}
+V4l2CameraDevice::V4l2CameraDevice(
+  std::string device,
+  bool use_v4l2_buffer_timestamps,
+  rclcpp::Duration timestamp_offset_duration,
+  bool drop_old_frames)
+: device_{std::move(device)},
+  fd_{-1},
+  streaming_{false},
+  use_v4l2_buffer_timestamps_{use_v4l2_buffer_timestamps},
+  timestamp_offset_{timestamp_offset_duration},
+  drop_old_frames_{drop_old_frames}
 {
+}
+
+V4l2CameraDevice::~V4l2CameraDevice()
+{
+  close();
 }
 
 bool V4l2CameraDevice::open()
@@ -45,7 +61,8 @@ bool V4l2CameraDevice::open()
   // Check if TSC offset applies
   setTSCOffset();
   
-  fd_ = ::open(device_.c_str(), O_RDWR);
+  int open_flags = drop_old_frames_ ? (O_RDWR | O_NONBLOCK) : O_RDWR;
+  fd_ = ::open(device_.c_str(), open_flags);
 
   if (fd_ < 0) {
     auto msg = std::ostringstream{};
@@ -177,11 +194,15 @@ bool V4l2CameraDevice::start()
       std::to_string(errno).c_str());
     return false;
   }
+  streaming_ = true;
   return true;
 }
 
 bool V4l2CameraDevice::stop()
 {
+  if (fd_ < 0 || !streaming_) {
+    return true;
+  }
   RCLCPP_INFO(rclcpp::get_logger("v4l2_camera"), "Stopping camera");
   // Stop stream
   unsigned type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -191,6 +212,8 @@ bool V4l2CameraDevice::stop()
       "Failed stream stop");
     return false;
   }
+
+  streaming_ = false;
 
   // De-initialize buffers
   for (auto const & buffer : buffers_) {
@@ -210,6 +233,19 @@ bool V4l2CameraDevice::stop()
   return true;
 }
 
+bool V4l2CameraDevice::close()
+{
+  // Stop streaming and release buffers if needed
+  stop();
+
+  if (fd_ >= 0) {
+    ::close(fd_);
+    fd_ = -1;
+  }
+
+  return true;
+}
+
 std::string V4l2CameraDevice::getCameraName()
 {
   auto name = std::string{reinterpret_cast<char *>(capabilities_.card)};
@@ -222,7 +258,7 @@ int64_t V4l2CameraDevice::getTimeOffset()
 {
   timespec system_sample, monotonic_sample;
   clock_gettime(CLOCK_REALTIME, &system_sample);
-  clock_gettime(CLOCK_MONOTONIC_RAW, &monotonic_sample);
+  clock_gettime(CLOCK_MONOTONIC, &monotonic_sample);
   return (static_cast<int64_t>(system_sample.tv_sec * 1e9) - static_cast<int64_t>(monotonic_sample.tv_sec * 1e9)
           + static_cast<int64_t>(system_sample.tv_nsec) - static_cast<int64_t>(monotonic_sample.tv_nsec));
 }
@@ -278,73 +314,131 @@ void V4l2CameraDevice::setTSCOffset()
 
 std::tuple<Image::UniquePtr, bool, std::optional<uint32_t>,
            std::optional<timeval>>
-V4l2CameraDevice::capture() {
-  auto buf = v4l2_buffer{};
-  rclcpp::Time buf_stamp;
+V4l2CameraDevice::capture()
+{
+  auto prepare_buffer = [](v4l2_buffer & buffer) {
+    buffer = v4l2_buffer{};
+    buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer.memory = V4L2_MEMORY_MMAP;
+  };
 
-  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  buf.memory = V4L2_MEMORY_MMAP;
+  auto dequeue_once = [&](v4l2_buffer & buffer) -> int {
+    prepare_buffer(buffer);
+    if (-1 == ioctl(fd_, VIDIOC_DQBUF, &buffer)) {
+      if (errno == EAGAIN) {
+        return 0;  // no buffer ready yet
+      }
+      RCLCPP_ERROR(
+        rclcpp::get_logger("v4l2_camera"),
+        "Error dequeueing buffer: %s (%s)", strerror(errno),
+        std::to_string(errno).c_str());
+      return -1;
+    }
+    return 1;
+  };
 
-  // Dequeue buffer with new image
-  if (-1 == ioctl(fd_, VIDIOC_DQBUF, &buf)) {
-    RCLCPP_ERROR(
-      rclcpp::get_logger("v4l2_camera"),
-      "Error dequeueing buffer: %s (%s)", strerror(errno),
-      std::to_string(errno).c_str());
-    return {nullptr, true, std::nullopt, std::nullopt};
-  }
+  Image::UniquePtr img;
+  bool is_v4l2_buffer_flag_error_detected = false;
+  std::optional<uint32_t> sequence{};
+  std::optional<timeval> raw_timestamp{};
 
-  if (use_v4l2_buffer_timestamps_) {
-    buf_stamp = rclcpp::Time(static_cast<int64_t>(buf.timestamp.tv_sec) * 1e9
-                             + static_cast<int64_t>(buf.timestamp.tv_usec) * 1e3 
-                             + getTimeOffset() - tsc_offset_);
-  
-  }
-  else {
-    buf_stamp = rclcpp::Clock{RCL_SYSTEM_TIME}.now();
-  }
-  buf_stamp = buf_stamp + timestamp_offset_;
+  auto process_buffer = [&](v4l2_buffer & buffer) -> bool {
+    rclcpp::Time buf_stamp;
+    if (use_v4l2_buffer_timestamps_) {
+      buf_stamp = rclcpp::Time(
+        static_cast<int64_t>(buffer.timestamp.tv_sec) * 1e9 +
+        static_cast<int64_t>(buffer.timestamp.tv_usec) * 1e3 +
+        getTimeOffset() - tsc_offset_);
+        timespec monotonic_sample;
+        clock_gettime(CLOCK_MONOTONIC, &monotonic_sample);
+    } else {
+      buf_stamp = rclcpp::Clock{RCL_SYSTEM_TIME}.now();
+    }
+    buf_stamp = buf_stamp + timestamp_offset_;
 
-  // Create image object
-  auto img = std::make_unique<Image>();
+    auto tmp_img = std::make_unique<Image>();
+    auto const & mapped_buffer = buffers_[buffer.index];
+    tmp_img->data.resize(cur_data_format_.imageByteSize);
+    std::copy(mapped_buffer.start, mapped_buffer.start + tmp_img->data.size(), tmp_img->data.begin());
 
-  // Copy over buffer data
-  auto const & buffer = buffers_[buf.index];
-  img->data.resize(cur_data_format_.imageByteSize);
-  std::copy(buffer.start, buffer.start + img->data.size(), img->data.begin());
+    // Accumulate error flag and update metadata with the most recent buffer
+    is_v4l2_buffer_flag_error_detected =
+      is_v4l2_buffer_flag_error_detected || ((buffer.flags & V4L2_BUF_FLAG_ERROR) != 0);
+    sequence = buffer.sequence;
+    raw_timestamp = buffer.timestamp;
 
-  // Check whether V4L2_BUF_FLAG_ERROR is set in v4l2_buffer.flags
-  bool is_v4l2_buffer_flag_error_detected = (buf.flags & V4L2_BUF_FLAG_ERROR);
-  // Get sequence number and raw buffer timestamp 
-  uint32_t sequence = buf.sequence;
-  timeval raw_timestamp = buf.timestamp;
+    if (-1 == ioctl(fd_, VIDIOC_QBUF, &buffer)) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("v4l2_camera"),
+        "Error re-queueing buffer: %s (%s)", strerror(errno),
+        std::to_string(errno).c_str());
+      return false;
+    }
 
-  // Requeue buffer to be reused for new captures
-  if (-1 == ioctl(fd_, VIDIOC_QBUF, &buf)) {
-    RCLCPP_ERROR(
-      rclcpp::get_logger("v4l2_camera"),
-      "Error re-queueing buffer: %s (%s)", strerror(errno),
-      std::to_string(errno).c_str());
-    return {nullptr, is_v4l2_buffer_flag_error_detected, sequence, raw_timestamp};
-  }
+    tmp_img->header.stamp = buf_stamp;
+    tmp_img->width = cur_data_format_.width;
+    tmp_img->height = cur_data_format_.height;
+    tmp_img->step = cur_data_format_.bytesPerLine;
+    if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_YUYV) {
+      tmp_img->encoding = sensor_msgs::image_encodings::YUV422_YUY2;
+    } else if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_UYVY) {
+      tmp_img->encoding = sensor_msgs::image_encodings::YUV422;
+    } else if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_GREY) {
+      tmp_img->encoding = sensor_msgs::image_encodings::MONO8;
+    } else {
+      RCLCPP_WARN(
+        rclcpp::get_logger("v4l2_camera"),
+        "Current pixel format is not supported yet");
+    }
 
-  // Fill in remaining image information
-  img->header.stamp = buf_stamp;
-  img->width = cur_data_format_.width;
-  img->height = cur_data_format_.height;
-  img->step = cur_data_format_.bytesPerLine;
-  if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_YUYV) {
-    img->encoding = sensor_msgs::image_encodings::YUV422_YUY2;
-  } else if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_UYVY) {
-    img->encoding = sensor_msgs::image_encodings::YUV422;
-  } else if (cur_data_format_.pixelFormat == V4L2_PIX_FMT_GREY) {
-    img->encoding = sensor_msgs::image_encodings::MONO8;
+    img = std::move(tmp_img);
+    return true;
+  };
+
+  v4l2_buffer buf{};
+
+  if (drop_old_frames_) {
+    // Wait for at least one buffer to be ready, then drain all ready buffers keeping the last
+    int ret = dequeue_once(buf);
+    if (ret == 0) {
+      pollfd pfd{};
+      pfd.fd = fd_;
+      pfd.events = POLLIN;
+      int poll_ret = ::poll(&pfd, 1, 1000);
+      if (poll_ret <= 0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("v4l2_camera"),
+          "Timeout waiting for frame while drop_old_frames is enabled");
+        return {nullptr, true, std::nullopt, std::nullopt};
+      }
+      ret = dequeue_once(buf);
+    }
+
+    if (ret != 1) {
+      return {nullptr, true, std::nullopt, std::nullopt};
+    }
+
+    do {
+      if (!process_buffer(buf)) {
+        return {nullptr, is_v4l2_buffer_flag_error_detected, sequence, raw_timestamp};
+      }
+      ret = dequeue_once(buf);
+    } while (ret == 1);
+
+    if (ret == -1) {
+      return {nullptr, true, std::nullopt, std::nullopt};
+    }
   } else {
-    RCLCPP_WARN(rclcpp::get_logger("v4l2_camera"), "Current pixel format is not supported yet");
+    if (dequeue_once(buf) != 1) {
+      return {nullptr, true, std::nullopt, std::nullopt};
+    }
+
+    if (!process_buffer(buf)) {
+      return {nullptr, is_v4l2_buffer_flag_error_detected, sequence, raw_timestamp};
+    }
   }
 
-  return std::make_tuple(std::move(img), is_v4l2_buffer_flag_error_detected,
-                         sequence, raw_timestamp);
+  return std::make_tuple(std::move(img), is_v4l2_buffer_flag_error_detected, sequence, raw_timestamp);
 }
 
 int32_t V4l2CameraDevice::getControlValue(uint32_t id)
@@ -715,3 +809,4 @@ bool V4l2CameraDevice::initMemoryMapping()
 
   return true;
 }
+

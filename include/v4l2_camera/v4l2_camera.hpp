@@ -123,6 +123,7 @@ private:
 
   bool publish_next_frame_;
   bool use_image_transport_;
+  bool drop_old_frames_;
 
   std::shared_ptr<diagnostic_updater::Updater> diag_updater_;
   std::shared_ptr<diagnostic_updater::CompositeDiagnosticTask> diag_composer_;
