@@ -113,6 +113,7 @@ private:
 
   std::string camera_frame_id_;
   std::string output_encoding_;
+  ImageSize output_image_size_;
 
   std::map<std::string, int32_t> control_name_to_id_;
 

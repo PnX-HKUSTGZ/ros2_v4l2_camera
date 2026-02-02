@@ -35,7 +35,9 @@
 
 #include "rclcpp_components/register_node_macro.hpp"
 #include "v4l2_camera/v4l2_camera_device.hpp"
-
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #ifdef ENABLE_CUDA
 #include <cuda.h>
 #include <nppi_color_conversion.h>
@@ -386,6 +388,11 @@ void V4L2Camera::createParameters()
     "output_encoding", std::string{"rgb8"},
     output_encoding_description);
 
+  auto output_image_size_descriptor = rcl_interfaces::msg::ParameterDescriptor{};
+  output_image_size_descriptor.name = "output_image_size";
+  output_image_size_descriptor.description = "Output image width & height. If set, image will be resized before publishing.";
+  output_image_size_ = declare_parameter<std::vector<int64_t>>("output_image_size", {}, output_image_size_descriptor);
+
   // Camera info parameters
   auto camera_info_url = declare_parameter("camera_info_url", "");
   if (get_parameter("camera_info_url", camera_info_url)) {
@@ -574,6 +581,9 @@ bool V4L2Camera::handleParameter(rclcpp::Parameter const & param)
   } else if (param.get_name() == "output_encoding") {
     output_encoding_ = param.as_string();
     return true;
+  } else if (param.get_name() == "output_image_size") {
+    output_image_size_ = param.as_integer_array();
+    return true;
   } else if (param.get_name() == "pixel_format") {
     camera_->stop();
     auto success = requestPixelFormat(param.as_string());
@@ -760,11 +770,13 @@ sensor_msgs::msg::Image::UniquePtr V4L2Camera::convert(sensor_msgs::msg::Image c
     get_logger(),
     "Converting: %s -> %s", img.encoding.c_str(), output_encoding_.c_str());
 
+  auto outImg = std::make_unique<sensor_msgs::msg::Image>();
+  bool converted = false;
+
   // TODO(sander): temporary until cv_bridge and image_proc are available in ROS 2
   if (img.encoding == sensor_msgs::image_encodings::YUV422_YUY2 &&
     output_encoding_ == sensor_msgs::image_encodings::RGB8)
   {
-    auto outImg = std::make_unique<sensor_msgs::msg::Image>();
     outImg->width = img.width;
     outImg->height = img.height;
     outImg->step = img.width * 3;
@@ -775,11 +787,10 @@ sensor_msgs::msg::Image::UniquePtr V4L2Camera::convert(sensor_msgs::msg::Image c
         img.data.data() + i * img.step, outImg->data.data() + i * outImg->step,
         outImg->width);
     }
-    return outImg;
+    converted = true;
   } else if (img.encoding == sensor_msgs::image_encodings::YUV422 &&
     output_encoding_ == sensor_msgs::image_encodings::RGB8)
   {
-    auto outImg = std::make_unique<sensor_msgs::msg::Image>();
     outImg->width = img.width;
     outImg->height = img.height;
     outImg->step = img.width * 3;
@@ -790,13 +801,41 @@ sensor_msgs::msg::Image::UniquePtr V4L2Camera::convert(sensor_msgs::msg::Image c
         img.data.data() + i * img.step, outImg->data.data() + i * outImg->step,
         outImg->width);
     }
-    return outImg;
-  }else {
+    converted = true;
+  } else {
     RCLCPP_WARN_ONCE(
       get_logger(),
       "Conversion not supported yet: %s -> %s", img.encoding.c_str(), output_encoding_.c_str());
     return nullptr;
   }
+
+  if (converted && output_image_size_.size() == 2) {
+    int target_width = static_cast<int>(output_image_size_[0]);
+    int target_height = static_cast<int>(output_image_size_[1]);
+
+    if(target_width > 0 && target_height > 0 && 
+       (target_width != static_cast<int>(outImg->width) || target_height != static_cast<int>(outImg->height)))
+    {
+       cv::Mat src(outImg->height, outImg->width, CV_8UC3, outImg->data.data(), outImg->step);
+       cv::Mat dst;
+       cv::resize(src, dst, cv::Size(target_width, target_height));
+       
+       outImg->width = target_width;
+       outImg->height = target_height;
+       outImg->step = target_width * 3;
+       outImg->data.resize(outImg->height * outImg->step);
+       
+       if(dst.isContinuous()) {
+         std::memcpy(outImg->data.data(), dst.data, outImg->data.size());
+       } else {
+         for(int i=0; i<dst.rows; ++i) {
+           std::memcpy(outImg->data.data() + i * outImg->step, dst.ptr(i), outImg->step);
+         }
+       }
+    }
+  }
+
+  return outImg;
 }
 
 bool V4L2Camera::checkCameraInfo(
